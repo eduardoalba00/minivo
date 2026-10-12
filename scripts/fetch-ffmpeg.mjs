@@ -4,7 +4,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, copyFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -70,7 +70,7 @@ try {
   else execFileSync("unzip", ["-q", archive, build.entry, "-d", work]);
   mkdirSync(dir, { recursive: true });
   const extracted = join(work, build.entry);
-  renameSync(extracted, dest);
+  copyFileSync(extracted, dest);
   chmodSync(dest, 0o755);
 } finally {
   rmSync(work, { recursive: true, force: true });
