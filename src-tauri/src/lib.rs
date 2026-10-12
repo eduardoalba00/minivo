@@ -1,8 +1,8 @@
 mod ffmpeg;
 
-use ffmpeg::{Done, Job, Probe, Progress};
+use ffmpeg::{Done, Encoder, Job, Probe, Progress};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::async_runtime::spawn_blocking;
 use tauri::ipc::Channel;
 use tauri::State;
@@ -16,6 +16,15 @@ fn ffmpeg_path() -> PathBuf {
     let dir = exe.parent().expect("executable has no directory");
     let name = format!("ffmpeg{}", std::env::consts::EXE_SUFFIX);
     dir.join(name)
+}
+
+/// The fastest encoder on this machine, measured once; callers block until the benchmark finishes.
+fn encoder() -> &'static Encoder {
+    static FASTEST: OnceLock<&'static Encoder> = OnceLock::new();
+    FASTEST.get_or_init(|| {
+        let ffmpeg = ffmpeg_path();
+        ffmpeg::fastest(&ffmpeg)
+    })
 }
 
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -43,11 +52,25 @@ async fn compress(
     *current.0.lock().unwrap() = Some(job.clone());
     blocking(move || {
         let ffmpeg = ffmpeg_path();
-        ffmpeg::compress(&ffmpeg, &path, target, &ffmpeg::X264, &job, |p| {
+        let encoder = encoder();
+        let on_progress = |p| {
             let _ = progress.send(p);
-        })
+        };
+        let result = ffmpeg::compress(&ffmpeg, &path, target, encoder, &job, on_progress);
+        // Hardware encoders reject some inputs (odd sizes, very high resolutions); x264 takes anything.
+        match result {
+            Err(e) if e != ffmpeg::CANCELLED && encoder.name != ffmpeg::X264.name => {
+                ffmpeg::compress(&ffmpeg, &path, target, &ffmpeg::X264, &job, on_progress)
+            }
+            result => result,
+        }
     })
     .await
+}
+
+#[tauri::command]
+async fn encoder_label() -> Result<&'static str, String> {
+    blocking(|| Ok(encoder().label)).await
 }
 
 #[tauri::command]
@@ -64,7 +87,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(Current::default())
-        .invoke_handler(tauri::generate_handler![probe, compress, cancel])
+        .setup(|_| {
+            std::thread::spawn(encoder);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![probe, compress, cancel, encoder_label])
         .run(tauri::generate_context!())
         .expect("error while running Minivo");
 }

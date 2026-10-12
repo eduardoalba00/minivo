@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Share of the target spent on the streams; the rest covers the MP4 container and encoder overshoot.
 const HEADROOM: f64 = 0.95;
@@ -13,13 +14,40 @@ const ATTEMPTS: u32 = 3;
 
 pub struct Encoder {
     pub name: &'static str,
+    pub label: &'static str,
     pub options: &'static [&'static str],
 }
 
 pub const X264: Encoder = Encoder {
     name: "libx264",
+    label: "x264 (CPU)",
     options: &["-preset", "veryfast"],
 };
+
+/// Tried in order; ones the machine can't run fail within milliseconds.
+static ENCODERS: [Encoder; 5] = [
+    Encoder {
+        name: "h264_videotoolbox",
+        label: "Apple VideoToolbox",
+        options: &["-constant_bit_rate", "1"],
+    },
+    Encoder {
+        name: "h264_nvenc",
+        label: "NVIDIA NVENC",
+        options: &["-preset", "p4", "-rc", "cbr"],
+    },
+    Encoder {
+        name: "h264_qsv",
+        label: "Intel Quick Sync",
+        options: &["-preset", "faster"],
+    },
+    Encoder {
+        name: "h264_amf",
+        label: "AMD AMF",
+        options: &["-quality", "speed", "-rc", "cbr"],
+    },
+    X264,
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +117,42 @@ pub fn command(ffmpeg: &Path) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// Times a short 1080p encode with each encoder and returns the fastest that works.
+pub fn fastest(ffmpeg: &Path) -> &'static Encoder {
+    let mut best = (&ENCODERS[4], Duration::MAX);
+    for encoder in &ENCODERS {
+        let elapsed = time_encode(ffmpeg, encoder);
+        if let Some(elapsed) = elapsed.filter(|e| *e < best.1) {
+            best = (encoder, elapsed);
+        }
+    }
+    best.0
+}
+
+fn time_encode(ffmpeg: &Path, encoder: &Encoder) -> Option<Duration> {
+    let start = Instant::now();
+    let status = command(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=1920x1080:r=30:d=4,noise=alls=12:allf=t",
+        ])
+        .args(["-c:v", encoder.name])
+        .args(encoder.options)
+        .args([
+            "-b:v", "4000k", "-maxrate", "4000k", "-bufsize", "8000k", "-pix_fmt", "yuv420p", "-f", "null", "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    status.success().then(|| start.elapsed())
 }
 
 pub fn probe(ffmpeg: &Path, input: &Path) -> Result<Probe, String> {
@@ -439,11 +503,23 @@ mod tests {
     }
 
     #[test]
-    fn compresses_under_target() {
+    fn compresses_under_target_with_x264() {
+        compresses_under_target(&X264, "x264.mp4");
+    }
+
+    #[test]
+    fn compresses_under_target_with_fastest() {
         let ffmpeg = bundled_ffmpeg();
-        let input = sample("under-target.mp4", 6);
+        let encoder = fastest(&ffmpeg);
+        println!("fastest encoder: {}", encoder.label);
+        compresses_under_target(encoder, "fastest.mp4");
+    }
+
+    fn compresses_under_target(encoder: &Encoder, name: &str) {
+        let ffmpeg = bundled_ffmpeg();
+        let input = sample(name, 6);
         let target = 2_000_000;
-        let done = compress(&ffmpeg, &input, target, &X264, &Job::default(), |_| {}).unwrap();
+        let done = compress(&ffmpeg, &input, target, encoder, &Job::default(), |_| {}).unwrap();
         let out = probe(&ffmpeg, &done.output).unwrap();
         std::fs::remove_file(&done.output).unwrap();
         assert!(
