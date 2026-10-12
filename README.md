@@ -12,7 +12,7 @@ Minivo shrinks videos to fit under a file size limit, like Discord's 20 MB cap o
 
 ## Features
 
-- **Hits the size you pick.** Choose 10, 20 or 50 MB, or type any size. Minivo plans the bitrate for your video's length, checks the result, and retries in the rare case the encoder overshoots.
+- **Hits the size you pick.** Choose 10, 20 or 50 MB, or type any size. Minivo plans the bitrate for your video's length and checks the result. It retries smaller if the encoder overshoots, and retries at full quality if easy footage like a screen recording came out far under the limit.
 - **Fast on every machine.** At startup Minivo benchmarks the encoders your machine has (Apple VideoToolbox, NVIDIA NVENC, Intel Quick Sync, AMD AMF, and x264 on the CPU) and uses whichever is fastest.
 - **Looks as good as the size allows.** When the budget is tight, Minivo lowers the resolution and caps the frame rate at 30 fps instead of smearing a 4K, 60 fps video into mush. Phone videos keep their orientation.
 - **Plays everywhere.** Output is H.264 and AAC in an MP4, which previews inline in Discord, iMessage, Slack, WhatsApp and email.
@@ -49,7 +49,7 @@ Minivo is a [Tauri](https://tauri.app) app. The interface is React, and the Rust
 1. **Probe:** read the video's duration, resolution, rotation and audio streams.
 2. **Plan:** turn the target size into a bitrate (`target × 8 × 0.95 ÷ duration`, minus audio), then pick a resolution and frame rate that bitrate can carry.
 3. **Encode:** run ffmpeg with constant bitrate on the fastest encoder, reporting progress as it goes.
-4. **Verify:** check the output size, and re-encode at a slightly lower bitrate if it came out too big.
+4. **Verify:** check the output size. Re-encode at a lower bitrate if it came out too big, or at a higher one if it was downscaled but used less than 70% of the target.
 
 The core logic is in [`src-tauri/src/ffmpeg.rs`](src-tauri/src/ffmpeg.rs).
 

@@ -56,7 +56,14 @@ pub struct Probe {
     pub width: u32,
     pub height: u32,
     pub has_audio: bool,
+    pub fps: Option<f64>,
     pub bytes: u64,
+}
+
+impl Probe {
+    fn short_side(&self) -> u32 {
+        self.width.min(self.height)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -179,12 +186,14 @@ fn parse_probe(info: &str, bytes: u64) -> Option<Probe> {
     if sideways {
         (width, height) = (height, width);
     }
+    let fps = video.split(", ").find_map(parse_fps);
     let has_audio = info.lines().any(|l| l.contains("Stream #") && l.contains("Audio:"));
     (duration > 0.0).then_some(Probe {
         duration,
         width,
         height,
         has_audio,
+        fps,
         bytes,
     })
 }
@@ -204,6 +213,12 @@ fn parse_size(field: &str) -> Option<(u32, u32)> {
     let width = w.parse().ok()?;
     let height = h.parse().ok()?;
     Some((width, height))
+}
+
+/// "29.97 fps".
+fn parse_fps(field: &str) -> Option<f64> {
+    let fps = field.strip_suffix(" fps")?;
+    fps.parse().ok()
 }
 
 /// Phone videos are often stored sideways with a rotation flag that ffmpeg applies when decoding.
@@ -246,6 +261,20 @@ pub fn plan(target: u64, duration: f64, has_audio: bool, scale: f64) -> Result<P
         max_short_side,
         cap_fps: video < 4000.0,
     })
+}
+
+impl Plan {
+    fn short_side(&self, info: &Probe) -> u32 {
+        let source = info.short_side();
+        self.max_short_side.map_or(source, |m| m.min(source))
+    }
+
+    /// Whether this plan lowers the resolution or frame rate of this video.
+    fn holds_back(&self, info: &Probe) -> bool {
+        let scaled = self.short_side(info) < info.short_side();
+        let slowed = self.cap_fps && info.fps.is_none_or(|f| f > 30.5);
+        scaled || slowed
+    }
 }
 
 fn filters(plan: &Plan) -> Vec<String> {
@@ -292,7 +321,16 @@ fn encode_args(input: &Path, output: &Path, plan: &Plan, encoder: &Encoder) -> V
     if plan.audio_kbps > 0 {
         args.extend(["-c:a", "aac", "-b:a", &audio]);
     }
-    args.extend(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", &output]);
+    args.extend([
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-f",
+        "mp4",
+        &output,
+    ]);
     args.into_iter().map(String::from).collect()
 }
 
@@ -314,7 +352,8 @@ pub fn output_path(input: &Path, target: u64) -> PathBuf {
     path
 }
 
-/// Encodes `input` to fit in `target` bytes, retrying at a lower bitrate if the encoder overshoots.
+/// Encodes `input` to fit in `target` bytes. Retries at a lower bitrate if the encoder overshoots, and at a
+/// higher one if easy footage (like a screen recording) came out far under the target after being downscaled.
 pub fn compress(
     ffmpeg: &Path,
     input: &Path,
@@ -325,36 +364,64 @@ pub fn compress(
 ) -> Result<Done, String> {
     let info = probe(ffmpeg, input)?;
     let output = output_path(input, target);
+    let draft = output.with_extension("part");
+    let result = fit(ffmpeg, input, &info, target, encoder, job, &output, &draft, on_progress);
+    let _ = std::fs::remove_file(&draft);
+    let failed = result.is_err();
+    if failed {
+        let _ = std::fs::remove_file(&output);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit(
+    ffmpeg: &Path,
+    input: &Path,
+    info: &Probe,
+    target: u64,
+    encoder: &Encoder,
+    job: &Job,
+    output: &Path,
+    draft: &Path,
+    on_progress: impl Fn(Progress),
+) -> Result<Done, String> {
     let mut scale = 1.0;
+    let mut kept = None;
     for attempt in 1..=ATTEMPTS {
         let plan = plan(target, info.duration, info.has_audio, scale)?;
-        let args = encode_args(input, &output, &plan, encoder);
-        let result = run(ffmpeg, &args, job, info.duration, |fraction, speed| {
+        let args = encode_args(input, draft, &plan, encoder);
+        run(ffmpeg, &args, job, info.duration, |fraction, speed| {
             on_progress(Progress {
                 fraction,
                 speed,
                 attempt,
             })
-        });
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&output);
-            return Err(e);
-        }
-        let metadata = std::fs::metadata(&output).map_err(|e| e.to_string())?;
+        })?;
+        let metadata = std::fs::metadata(draft).map_err(|e| e.to_string())?;
         let bytes = metadata.len();
-        if bytes <= target {
-            let short_side = info.width.min(info.height);
-            let short_side = plan.max_short_side.map_or(short_side, |m| m.min(short_side));
-            return Ok(Done {
-                output,
-                bytes,
-                short_side,
-            });
-        }
         scale *= target as f64 / bytes as f64 * 0.97;
+        if bytes > target {
+            // An upgrade that no longer fits; the previous result stands.
+            match kept {
+                Some(_) => break,
+                None => continue,
+            }
+        }
+        std::fs::rename(draft, output).map_err(|e| e.to_string())?;
+        let short_side = plan.short_side(info);
+        kept = Some(Done {
+            output: output.to_path_buf(),
+            bytes,
+            short_side,
+        });
+        let roomy = bytes < target * 7 / 10;
+        let held_back = plan.holds_back(info);
+        if !(roomy && held_back) {
+            break;
+        }
     }
-    let _ = std::fs::remove_file(&output);
-    Err("Couldn't get this video under the size. Try a larger size.".into())
+    kept.ok_or_else(|| "Couldn't get this video under the size. Try a larger size.".into())
 }
 
 fn run(ffmpeg: &Path, args: &[String], job: &Job, duration: f64, on_progress: impl Fn(f64, f64)) -> Result<(), String> {
@@ -430,6 +497,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 has_audio: true,
+                fps: Some(60.0),
                 bytes: 1
             }
         );
@@ -529,6 +597,47 @@ mod tests {
         );
         assert_eq!((out.width.min(out.height), out.has_audio), (done.short_side, true));
         assert!((out.duration - 6.0).abs() < 0.2, "{}", out.duration);
+    }
+
+    #[test]
+    fn spends_spare_room_on_easy_footage() {
+        // A small moving box on a flat background, like a screen recording: far cheaper than planned.
+        let ffmpeg = bundled_ffmpeg();
+        let dir = std::env::temp_dir().join("minivo-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("easy.mp4");
+        let graph = "color=c=0x334455:s=1920x1080:r=60:d=8[bg];testsrc2=s=160x90:r=60[fg];[bg][fg]overlay=x='t*120':y=500:shortest=1";
+        let status = command(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                graph,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let target = 2_000_000;
+        let done = compress(&ffmpeg, &input, target, &X264, &Job::default(), |p| {
+            attempts.fetch_max(p.attempt, Ordering::SeqCst);
+        })
+        .unwrap();
+        let out = probe(&ffmpeg, &done.output).unwrap();
+        std::fs::remove_file(&done.output).unwrap();
+        // The first plan caps 60 fps to 30; the retry lifts that and still fits.
+        assert!(attempts.into_inner() >= 2);
+        assert_eq!(out.fps, Some(60.0));
+        assert!(done.bytes <= target, "{} bytes", done.bytes);
     }
 
     #[test]
